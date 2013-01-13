@@ -44,10 +44,10 @@ class Message(object):
 
 class RA(object):
 
-    def send_message_to_node(self,node,message):
-        self.send_message((self.nodes[node]["Ip"],self.nodes[node]["Port"]),message)
+    def __send_message_to_node(self,node,message):
+        self.__send_message((self.nodes[node]["Ip"],self.nodes[node]["Port"]),message)
      
-    def send_message(self,addr,message):
+    def __send_message(self,addr,message):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect(addr) 
         s.send(message)
@@ -72,7 +72,7 @@ class RA(object):
         if not self.nodes.has_key(in_unique_name):
             #unknown node
             dead = Message(Message.TYPE.DEAD,{Status: "RE_INIT"})
-            self.send_message(arg[1],dead)
+            self.__send_message(arg[1],dead)
             return
         self.var_lock.acquire()
         self.highest_seq_num = max(self.highest_seq_num,in_seq_num)
@@ -83,7 +83,7 @@ class RA(object):
         else:
             reply = Message()
             to_send = reply.prepare(Message.TYPE.REPLY,{})
-            self.send_message_to_node(in_unique_name,to_send)
+            self.__send_message_to_node(in_unique_name,to_send)
 
     def __handle_init_message(self,args):
         content = args[0]
@@ -99,18 +99,18 @@ class RA(object):
             if ((self.nodes.has_key(content["UniqueName"])) or (self.info["UniqueName"] == content["UniqueName"])):
                 sponsor_info =  { "UniqueName": self.info["UniqueName"] }
                 init_data = {"From": "Sponsor", "SponsorData": sponsor_info, "Status": "NOT_UNIQUE"}
-                send_to_new = mess.prepare("INIT",init_data)
+                send_to_new = mess.prepare(Message.TYPE.INIT,init_data)
             else:
                 new_info = { "UniqueName": content["UniqueName"], "Ip": addr[0], "Port": content["Port"]}
                 sponsor_info =  { "UniqueName": self.info["UniqueName"] }
-                send_to_nodes = mess.prepare("INIT",{"From": "Node", "SponsorData": sponsor_info, "NewData": new_info})
+                send_to_nodes = mess.prepare(Message.TYPE.INIT,{"From": "Node", "SponsorData": sponsor_info, "NewData": new_info})
                 for node in self.nodes:
-                    self.send_message_to_node(node,send_to_nodes)
+                    self.__send_message_to_node(node,send_to_nodes)
                 sponsor_info =  { "UniqueName": self.info["UniqueName"], "Port": self.info["Port"] }
                 init_data = {"From": "Sponsor", "SponsorData": sponsor_info,"Status": "OK", "NodesData": self.nodes}
-                send_to_new = mess.prepare("INIT",init_data)
+                send_to_new = mess.prepare(Message.TYPE.INIT,init_data)
                 self.nodes[content["UniqueName"]] = { "Ip": addr[0], "Port": content["Port"]}
-            self.send_message((addr[0],content["Port"]),send_to_new)
+            self.__send_message((addr[0],content["Port"]),send_to_new)
             self.release()
         elif content["From"] == "Node":
             self.nodes[content["NewData"]["UniqueName"]] = { "Ip": content["NewData"]["Ip"], "Port": content["NewData"]["Port"] }
@@ -188,11 +188,8 @@ class RA(object):
         thread.start()
         
     def init(self,addr):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(addr) 
         mess = Message(Message.TYPE.INIT,{"From": "New", "UniqueName": self.info["UniqueName"], "Port": self.info["Port"]})
-        toSend = mess.prepare()
-        s.send(toSend)
+        self.__send_message(addr,mess.prepare())
         #wait until initialization ends
         self.init_sem.acquire()
         return (self.init_done, self.init_status)
@@ -210,7 +207,7 @@ class RA(object):
         body.update({"SeqNum":self.seq_num})
         mess = Message(Message.TYPE.REQUEST,body)
         for node in self.nodes:
-            self.send_message_to_node(node,mess.prepare()); 
+            self.__send_message_to_node(node,mess.prepare()); 
         while  self.oustanding_reply_count !=  0: 
             pass
         return True
@@ -223,7 +220,7 @@ class RA(object):
             if self.reply_deffered.get(node):
                 self.reply_deffered[node] = False
                 mess = Message(Message.TYPE.REPLY,{})
-                self.send_message_to_node(node,mess.prepare())
+                self.__send_message_to_node(node,mess.prepare())
         return True
 
     def dispose(self):
