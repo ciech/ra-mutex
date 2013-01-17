@@ -5,8 +5,9 @@ import time
 
 
 BUFSIZ = 1024
+TIMEOUT = 10
 
-SUPPORTED_MSG_TYPES = ["INIT","REPLY","REQUEST","ARE_YOU_THERE","DEAD","INFO","DISPOSE"]
+SUPPORTED_MSG_TYPES = ["INIT","REPLY","REQUEST","ARE_YOU_THERE","YES_I_AM_HERE","DEAD","HIGHEST_SEQ_NUM"]
 
 class Enum(set):
     def __getattr__(self, name):
@@ -17,29 +18,35 @@ class Enum(set):
 class Message(object):
     TYPE = Enum(SUPPORTED_MSG_TYPES)
 
-    def __init__(self,msg_type=None,msg_content=None):
+    def __init__(self,msg_type=None,msg_from=None,msg_content=None):
         if (msg_type != None):
             if (msg_type not in SUPPORTED_MSG_TYPES):
                 raise Exception("Unknown message type")
-        
-        self.type=msg_type
+        self.type = msg_type
+        self.sender = msg_from
         self.content = msg_content
 
-
     def __str__(self):
-        return "Message: TYPE = " + "None" if (self.type == None) else self.type \
-                + " CONTENT = " + "None" if (self.content == None) else str(self.content)
+        return "Message: TYPE = " + ("None" if (self.type == None) else self.type) \
+                + " FROM = " + ("None" if (self.type == None) else str(self.sender)) \
+                + " CONTENT = " + ("None" if (self.content == None) else str(self.content))
 
-    def prepare(self,msg_type=None,msg_content=None):
-        if (msg_type != None and msg_content != None):
-            self.__init__(msg_type,msg_content)
-        return json.dumps({ "TYPE": self.type, "CONTENT": self.content})
+    def prepare(self,msg_type=None,msg_from=None,msg_content=None):
+        if (msg_type == None and msg_from == None and msg_content == None):
+            pass
+        elif (msg_type != None and msg_from != None and msg_content != None):
+            self.__init__(msg_type,msg_from ,msg_content)
+        else:
+            raise Exception("Bad Parse Args")
 
+        return json.dumps({"TYPE": self.type, "FROM": self.sender, "CONTENT": self.content})
+        
     def parse(self,msg):
         parsed_msg = json.loads(msg)
         if (parsed_msg["TYPE"] not in SUPPORTED_MSG_TYPES):
             raise Exception("Unknown message type")
         self.type = parsed_msg["TYPE"]
+        self.sender = parsed_msg["FROM"]
         self.content = parsed_msg["CONTENT"]
 
 class RA(object):
@@ -59,21 +66,11 @@ class RA(object):
             self.oustanding_reply_count -= 1
         self.var_lock.release()
 
-    def __handle_info_message(self,args):
-        pass
-
-    def __handle_dispose_message(self,args):
-        pass
-
     def __handle_request_message(self,args):
-        content = args[0]
+        sender = args[0]
+        content = args[1]
         in_seq_num = content["SeqNum"]
-        in_unique_name = content["UniqueName"]
-        if not self.nodes.has_key(in_unique_name):
-            #unknown node
-            dead = Message(Message.TYPE.DEAD,{Status: "RE_INIT"})
-            self.__send_message(arg[1],dead)
-            return
+        in_unique_name = sender["UniqueName"]
         self.var_lock.acquire()
         self.highest_seq_num = max(self.highest_seq_num,in_seq_num)
         defer_it = (self.requesting_cs and ((in_seq_num > self.seq_num) or ((in_seq_num == self.seq_num) and in_unique_name > self.info["UniqueName"])))
@@ -82,13 +79,17 @@ class RA(object):
             self.reply_deffered[in_unique_name] = True
         else:
             reply = Message()
-            to_send = reply.prepare(Message.TYPE.REPLY,{})
-            self.__send_message_to_node(in_unique_name,to_send)
+            to_send = reply.prepare(Message.TYPE.REPLY,self.info,{})
+            try:
+                self.__send_message_to_node(in_unique_name,to_send)
+            except socket.error, msg:
+                print 'Failed to create socket. Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
 
     def __handle_init_message(self,args):
-        content = args[0]
-        addr = args[1]
-        if content["From"] == "New":
+        sender = args[0]
+        content = args[1]
+        addr = args[2]
+        if content["Role"] == "New":
             self.acquire()
             #check if we are first
             if (len(self.nodes) == 0):
@@ -96,29 +97,25 @@ class RA(object):
                 self.init_done = True
             #check if new node name is Unique
             mess = Message()
-            if ((self.nodes.has_key(content["UniqueName"])) or (self.info["UniqueName"] == content["UniqueName"])):
-                sponsor_info =  { "UniqueName": self.info["UniqueName"] }
-                init_data = {"From": "Sponsor", "SponsorData": sponsor_info, "Status": "NOT_UNIQUE"}
-                send_to_new = mess.prepare(Message.TYPE.INIT,init_data)
+            if ((self.nodes.has_key(sender["UniqueName"])) or (self.info["UniqueName"] == sender["UniqueName"])):
+                init_data = {"Role": "Sponsor", "Status": "NOT_UNIQUE"}
+                send_to_new = mess.prepare(Message.TYPE.INIT,self.info,init_data)
             else:
-                new_info = { "UniqueName": content["UniqueName"], "Ip": addr[0], "Port": content["Port"]}
-                sponsor_info =  { "UniqueName": self.info["UniqueName"] }
-                send_to_nodes = mess.prepare(Message.TYPE.INIT,{"From": "Node", "SponsorData": sponsor_info, "NewData": new_info})
+                send_to_nodes = mess.prepare(Message.TYPE.INIT,self.info, {"Role": "Node", "NewData": sender})
                 for node in self.nodes:
                     self.__send_message_to_node(node,send_to_nodes)
-                sponsor_info =  { "UniqueName": self.info["UniqueName"], "Port": self.info["Port"] }
-                init_data = {"From": "Sponsor", "SponsorData": sponsor_info,"Status": "OK", "NodesData": self.nodes}
-                send_to_new = mess.prepare(Message.TYPE.INIT,init_data)
-                self.nodes[content["UniqueName"]] = { "Ip": addr[0], "Port": content["Port"]}
-            self.__send_message((addr[0],content["Port"]),send_to_new)
+                init_data = {"Role": "Sponsor", "Status": "OK", "NodesData": self.nodes}
+                send_to_new = mess.prepare(Message.TYPE.INIT,self.info,init_data)
+                self.nodes[sender["UniqueName"]] = { "Ip": sender["Ip"], "Port": sender["Port"]}
+            self.__send_message((sender["Ip"],sender["Port"]),send_to_new)
             self.release()
-        elif content["From"] == "Node":
+        elif content["Role"] == "Node":
             self.nodes[content["NewData"]["UniqueName"]] = { "Ip": content["NewData"]["Ip"], "Port": content["NewData"]["Port"] }
-        elif content["From"] == "Sponsor":
+        elif content["Role"] == "Sponsor":
             self.init_status = content["Status"]
             if (self.init_status == "OK"):
                 self.nodes = content["NodesData"]
-                self.nodes[content["SponsorData"]["UniqueName"]] = { "Ip": addr[0], "Port": content["SponsorData"]["Port"]}
+                self.nodes[sender["UniqueName"]] = { "Ip": sender["Ip"], "Port": sender["Port"]}
                 self.init_done = True
             else:
                 self.init_done = False
@@ -137,77 +134,114 @@ class RA(object):
             self.init_status = "RE_INIT"
             self.var_lock.release()
 
+    def __handle_highest_seq_num_message(self,args):
+        sender = args[0]
+        content = args[1]
+        if (content["STATUS"]=="GET"):
+            mess = Message(Message.TYPE.HIGHEST_SEQ_NUM,self.info,{"STATUS":"RESPONSE", "VALUE": self.highest_seq_num})
+            self.__send_message_to_node(sender["UniqueName"],mess.prepare())
+        elif (content["STATUS"]=="RESPONSE"):
+            self.nodes_highest_seq_num[sender["UniqueName"]] = int(content["VALUE"])
+            if len(self.nodes_highest_seq_num) == len(self.nodes):
+                self.init_sem.release()
+
+
+    def __handle_unknown_node(self,args):
+        dead = Message(Message.TYPE.DEAD,self.info,{"STATUS": "RE_INIT"})
+        self.__send_message(arg[1],dead)
 
     def __msg_handle_dispatcher(self,sock,addr):
         data = sock.recv(BUFSIZ)
         msg = Message()
         msg.parse(data)
-        #match msg with proper handler
-        args = (msg.content, addr)
-        {
-            Message.TYPE.REPLY              : self.__handle_reply_message,
-            Message.TYPE.REQUEST            : self.__handle_request_message,
-            Message.TYPE.INIT               : self.__handle_init_message,
-            Message.TYPE.ARE_YOU_THERE      : self.__handle_are_you_there_message,
-            Message.TYPE.DEAD               : self.__handle_dead_message,
-            Message.TYPE.INFO               : self.__handle_init_message,
-            Message.TYPE.DISPOSE            : self.__handle_dispose_message
-        }[msg.type](args)
-
+        args = (msg.sender, msg.content, addr)
+        if (( msg.type != Message.TYPE.INIT )and ( not self.nodes.has_key(msg.sender["UniqueName"]))):
+            self.__handle_unknown_node(args)
+        else:
+            #match msg with proper handler
+            {
+                Message.TYPE.REPLY                  : self.__handle_reply_message,
+                Message.TYPE.REQUEST                : self.__handle_request_message,
+                Message.TYPE.INIT                   : self.__handle_init_message,
+                Message.TYPE.ARE_YOU_THERE          : self.__handle_are_you_there_message,
+                Message.TYPE.DEAD                   : self.__handle_dead_message,
+                Message.TYPE.HIGHEST_SEQ_NUM        : self.__handle_highest_seq_num_message,
+            }[msg.type](args)
 
     def __msg_listener(self):   
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(('', self.info["Port"]))
-        addr, port = s.getsockname()
         self.var_lock.acquire()
+        #if port == 0 it will be set by OS
+        s.bind((self.info["Ip"], self.info["Port"]))
+        addr, port = s.getsockname()
+        self.info['Ip'] = ("127.0.0.1" if addr == "0.0.0.0" else addr )
         self.info['Port'] = port
         self.var_lock.release()
+        self.listener_sem.release()
         s.listen(2)
         while 1:
             client, addr = s.accept()
             thread = threading.Thread(target = self.__msg_handle_dispatcher, args = ((client, addr)))
             thread.start()
 
-    def __init__(self,name,port=0):
+    def __init__(self,name,ip='',port=0):
         self.seq_num = 0
         self.highest_seq_num = 0
         self.oustanding_reply_count = 0
         self.requesting_cs = False
+        self.disposing = False
         self.reply_deffered = {}
+        self.awaiting_reply = {}
+        self.nodes_highest_seq_num = {}
         self.nodes = {}
         self.info = {}
         self.init_status = ""
         self.init_done = False
         self.init_sem = threading.Semaphore(0)
+        self.listener_sem = threading.Semaphore(0)
         self.var_lock = threading.Lock()   
         self.var_lock.acquire()
+        self.info['Ip'] = ip
         self.info['Port'] = port
         self.info['UniqueName'] = name
         self.var_lock.release()
         thread = threading.Thread(target = self.__msg_listener)
         thread.start()
+        self.listener_sem.acquire()
         
     def init(self,addr):
-        mess = Message(Message.TYPE.INIT,{"From": "New", "UniqueName": self.info["UniqueName"], "Port": self.info["Port"]})
+        mess = Message(Message.TYPE.INIT,self.info,{"Role":"New"})
         self.__send_message(addr,mess.prepare())
         #wait until initialization ends
         self.init_sem.acquire()
+        for node in self.nodes:
+            mess = Message(Message.TYPE.HIGHEST_SEQ_NUM,self.info,{"STATUS":"GET"})
+            self.__send_message_to_node(node, mess.prepare())
+        self.init_sem.acquire()
+        highest_num = -1
+        for num in self.nodes_highest_seq_num:
+            if self.nodes_highest_seq_num[num] > highest_num: highest_num = self.nodes_highest_seq_num[num]
+        self.highest_seq_num = highest_num
         return (self.init_done, self.init_status)
 
     def acquire(self):
         print "Node " + self.info["UniqueName"] + " used ACQUIRE"
         if not self.init_done: return False
+        if self.disposing: return False
         self.var_lock.acquire()
         self.requesting_cs = True
-        self.seq_num = self.highest_seq_num + 1
+        print self.highest_seq_num 
+        self.seq_num = int(self.highest_seq_num)+ 1
         self.var_lock.release()
         self.oustanding_reply_count = len(self.nodes)
-        body = {} 
-        body.update(self.info)
-        body.update({"SeqNum":self.seq_num})
-        mess = Message(Message.TYPE.REQUEST,body)
+        mess = Message(Message.TYPE.REQUEST,self.info,{"SeqNum":self.seq_num})
         for node in self.nodes:
-            self.__send_message_to_node(node,mess.prepare()); 
+            try:
+                self.__send_message_to_node(node,mess.prepare()); 
+            except socket.error, msg:
+                print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
+        
+ #       threading.Timer(TIMEOUT, function)
         while  self.oustanding_reply_count !=  0: 
             pass
         return True
@@ -219,9 +253,20 @@ class RA(object):
         for node in self.nodes:
             if self.reply_deffered.get(node):
                 self.reply_deffered[node] = False
-                mess = Message(Message.TYPE.REPLY,{})
-                self.__send_message_to_node(node,mess.prepare())
+                mess = Message(Message.TYPE.REPLY,self.info,{})
+                try:
+                    self.__send_message_to_node(node,mess.prepare()); 
+                except socket.error, msg:
+                    print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
         return True
 
     def dispose(self):
-        print "TODO"
+        self.disposing = True
+        if self.requesting_cs: self.release()
+        mess = Message(Message.TYPE.DEAD,self.info,{"Status": "REMOVE", "Node": self.info})
+        for node in self.nodes:
+            try:
+                self.__send_message_to_node(node,mess.prepare()); 
+            except socket.error, msg:
+                print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
+
