@@ -52,8 +52,22 @@ class Message(object):
 class RA(object):
 
     def __send_message_to_node(self,node,message):
-        self.__send_message((self.nodes[node]["Ip"],self.nodes[node]["Port"]),message)
-     
+        try:
+            self.__send_message((self.nodes[node]["Ip"],self.nodes[node]["Port"]),message)
+        except socket.error, msg:
+            print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]  
+            print "Deleting node: " + node   
+            self.var_lock.acquire()
+            del self.nodes[node]
+            if self.requesting_cs:
+                if (self.oustanding_reply_count > 0):
+                    self.oustanding_reply_count -= 1
+            self.var_lock.release()
+            dead = Message(Message.TYPE.DEAD,self.info,{"Status": "REMOVE", "Node": node})
+            for node in self.nodes.keys():
+                self.__send_message_to_node(node,dead.prepare())
+
+
     def __send_message(self,addr,message):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect(addr) 
@@ -119,15 +133,24 @@ class RA(object):
                 self.init_done = True
             else:
                 self.init_done = False
-            self.init_sem.release()        
+            self.init_event.set()        
+            self.init_event.clear()
 
     def __handle_are_you_there_message(self,args):
-        print args + "NOT_SUPPORTED_YET"
+        sender = args[0]
+        content = args[1]
+        mess = Message(Message.TYPE.YES_I_AM_HERE,self.info,{})
+        self.__send_message_to_node(sender["UniqueName"].mess.prepare())
 
     def __handle_dead_message(self,args):
-        content = args[0]
+        print "HANDLE_DEAD " + str(args[1])
+        sender = args[0]
+        content = args[1]
         if (content["Status"] == "REMOVE"):
-            pass
+            self.var_lock.acquire()
+            if self.nodes.has_key(content["Node"]):
+                del self.nodes[content["Node"]]
+            self.var_lock.release()
         elif (content["Status"] == "RE_INIT"):
             self.var_lock.acquire()
             self.init_done = False
@@ -143,12 +166,20 @@ class RA(object):
         elif (content["STATUS"]=="RESPONSE"):
             self.nodes_highest_seq_num[sender["UniqueName"]] = int(content["VALUE"])
             if len(self.nodes_highest_seq_num) == len(self.nodes):
-                self.init_sem.release()
+                self.init_event.set()
+                self.init_event.clear()
 
+    def __handle_yes_i_am_here(self,args):
+        sender = args[0]
+        content = args[1]
+        i_am_here= Message(Message.TYPE.YES_I_AM_HERE,self.info,{})
+        self.__send_message((sender['Ip'],sender['Port']),i_am_here.prepare())
 
     def __handle_unknown_node(self,args):
+        sender = args[0]
+        content = args[1]
         dead = Message(Message.TYPE.DEAD,self.info,{"STATUS": "RE_INIT"})
-        self.__send_message(arg[1],dead)
+        self.__send_message((sender['Ip'],sender['Port']),dead.prepare())
 
     def __msg_handle_dispatcher(self,sock,addr):
         data = sock.recv(BUFSIZ)
@@ -166,6 +197,7 @@ class RA(object):
                 Message.TYPE.ARE_YOU_THERE          : self.__handle_are_you_there_message,
                 Message.TYPE.DEAD                   : self.__handle_dead_message,
                 Message.TYPE.HIGHEST_SEQ_NUM        : self.__handle_highest_seq_num_message,
+                Message.TYPE.YES_I_AM_HERE          : self.__handle_yes_i_am_here
             }[msg.type](args)
 
     def __msg_listener(self):   
@@ -177,7 +209,8 @@ class RA(object):
         self.info['Ip'] = ("127.0.0.1" if addr == "0.0.0.0" else addr )
         self.info['Port'] = port
         self.var_lock.release()
-        self.listener_sem.release()
+        self.listener_event.set()
+        self.listener_event.clear()
         s.listen(2)
         while 1:
             client, addr = s.accept()
@@ -197,8 +230,8 @@ class RA(object):
         self.info = {}
         self.init_status = ""
         self.init_done = False
-        self.init_sem = threading.Semaphore(0)
-        self.listener_sem = threading.Semaphore(0)
+        self.init_event = threading.Event()
+        self.listener_event = threading.Event()
         self.var_lock = threading.Lock()   
         self.var_lock.acquire()
         self.info['Ip'] = ip
@@ -207,17 +240,18 @@ class RA(object):
         self.var_lock.release()
         thread = threading.Thread(target = self.__msg_listener)
         thread.start()
-        self.listener_sem.acquire()
+        #wait for listener thread initialization
+        self.listener_event.wait()
         
     def init(self,addr):
         mess = Message(Message.TYPE.INIT,self.info,{"Role":"New"})
         self.__send_message(addr,mess.prepare())
         #wait until initialization ends
-        self.init_sem.acquire()
-        for node in self.nodes:
+        self.init_event.wait()
+        for node in self.nodes.keys():
             mess = Message(Message.TYPE.HIGHEST_SEQ_NUM,self.info,{"STATUS":"GET"})
             self.__send_message_to_node(node, mess.prepare())
-        self.init_sem.acquire()
+        self.init_event.wait()
         highest_num = -1
         for num in self.nodes_highest_seq_num:
             if self.nodes_highest_seq_num[num] > highest_num: highest_num = self.nodes_highest_seq_num[num]
@@ -225,9 +259,9 @@ class RA(object):
         return (self.init_done, self.init_status)
 
     def acquire(self):
-        print "Node " + self.info["UniqueName"] + " used ACQUIRE"
         if not self.init_done: return False
         if self.disposing: return False
+        print "ACQUIRE"
         self.var_lock.acquire()
         self.requesting_cs = True
         print self.highest_seq_num 
@@ -235,22 +269,22 @@ class RA(object):
         self.var_lock.release()
         self.oustanding_reply_count = len(self.nodes)
         mess = Message(Message.TYPE.REQUEST,self.info,{"SeqNum":self.seq_num})
-        for node in self.nodes:
+        for node in self.nodes.keys():
             try:
                 self.__send_message_to_node(node,mess.prepare()); 
             except socket.error, msg:
-                print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
-        
- #       threading.Timer(TIMEOUT, function)
+                print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]      
+        #threading.Timer(TIMEOUT, function)
+        print "Wait for RESPONSE"
         while  self.oustanding_reply_count !=  0: 
             pass
         return True
 
     def release(self):
-        print "Node " + self.info["UniqueName"] + " used RELEASE"
         if not self.init_done: return False
+        print "RELEASE"
         self.requesting_cs = False 
-        for node in self.nodes:
+        for node in self.nodes.keys():
             if self.reply_deffered.get(node):
                 self.reply_deffered[node] = False
                 mess = Message(Message.TYPE.REPLY,self.info,{})
@@ -263,10 +297,12 @@ class RA(object):
     def dispose(self):
         self.disposing = True
         if self.requesting_cs: self.release()
-        mess = Message(Message.TYPE.DEAD,self.info,{"Status": "REMOVE", "Node": self.info})
+        mess = Message(Message.TYPE.DEAD,self.info,{"Status": "REMOVE", "Node": self.info["UniqueName"]})
         for node in self.nodes:
             try:
                 self.__send_message_to_node(node,mess.prepare()); 
             except socket.error, msg:
                 print 'Error code: ' + str(msg[0]) + ' , Error message : ' + msg[1]
+        self.disposing = False
+        self.init_done = False
 
